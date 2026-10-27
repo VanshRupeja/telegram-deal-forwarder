@@ -11,6 +11,8 @@ Monitors Telegram deal channels in real-time:
 """
 
 import asyncio
+from datetime import datetime, timezone
+import json
 import logging
 import os
 import random
@@ -68,6 +70,20 @@ target_bot_entity = None
 my_channel_entity = None
 current_user = None
 aiohttp_session: Optional[aiohttp.ClientSession] = None
+stats = {
+    "status": "Starting",
+    "telegram_connected": False,
+    "user": None,
+    "amazon_deals": 0,
+    "extrape_deals": 0,
+    "last_deal_at": None,
+    "last_deal_title": None,
+    "error": None,
+    "uptime_start": None,
+    "source_channels": [],
+    "target_channel": str(config.MY_TELEGRAM_CHANNEL or "Not configured"),
+    "target_bot": str(config.TARGET_BOT or "Not configured"),
+}
 
 
 # ==============================================================================
@@ -120,7 +136,8 @@ async def send_amazon_deal_with_retry(job: dict):
                                 formatting_entities=updated_entities,
                             )
                         except Exception as caption_err:
-                            if "caption is too long" in str(caption_err).lower():
+                            err_str = str(caption_err).lower()
+                            if "caption is too long" in err_str:
                                 logger.warning("Caption exceeded limit on Telegram server. Splitting into media + text message...")
                                 await client.send_message(my_channel_entity, file=event.message.media)
                                 await client.send_message(
@@ -128,6 +145,14 @@ async def send_amazon_deal_with_retry(job: dict):
                                     converted_text,
                                     formatting_entities=updated_entities,
                                     link_preview=False,
+                                )
+                            elif "file reference has expired" in err_str or "filereference" in err_str:
+                                logger.warning("Media file reference expired. Posting converted deal text without media...")
+                                await client.send_message(
+                                    my_channel_entity,
+                                    converted_text,
+                                    formatting_entities=updated_entities,
+                                    link_preview=True,
                                 )
                             else:
                                 raise caption_err
@@ -137,7 +162,11 @@ async def send_amazon_deal_with_retry(job: dict):
                             "Message length (%d chars) exceeds 1024-char media caption limit. Sending media first, then text...",
                             len(converted_text),
                         )
-                        await client.send_message(my_channel_entity, file=event.message.media)
+                        try:
+                            await client.send_message(my_channel_entity, file=event.message.media)
+                        except Exception as m_err:
+                            if "file reference has expired" in str(m_err).lower():
+                                logger.warning("Media file reference expired. Skipping media attachment.")
                         await client.send_message(
                             my_channel_entity,
                             converted_text,
@@ -161,6 +190,9 @@ async def send_amazon_deal_with_retry(job: dict):
                 )
 
             logger.info("✓ Successfully posted Amazon deal to your channel!")
+            stats["amazon_deals"] += 1
+            stats["last_deal_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            stats["last_deal_title"] = f"Amazon deal from [{channel_name}]"
             return
 
         except FloodWaitError as flood_err:
@@ -188,7 +220,8 @@ async def send_extrape_deal_with_retry(job: dict):
     """Sends non-Amazon deal links to ExtraPe Bot for affiliate conversion."""
     global target_bot_entity
     event = job["event"]
-    deal_urls = job["deal_urls"]
+    deal_urls = job.get("deal_urls", [])
+    channel_name = job.get("channel_name", "Unknown")
 
     if config.FORWARD_FULL_MESSAGE:
         max_retries = 3
@@ -197,6 +230,9 @@ async def send_extrape_deal_with_retry(job: dict):
                 logger.info("Sending full message + media to ExtraPe (%s)...", config.TARGET_BOT)
                 await client.send_message(target_bot_entity, event.message)
                 logger.info("✓ Successfully sent deal to ExtraPe (%s).", config.TARGET_BOT)
+                stats["extrape_deals"] += 1
+                stats["last_deal_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                stats["last_deal_title"] = f"Deal from [{channel_name}]"
                 return
 
             except FloodWaitError as flood_err:
@@ -205,7 +241,24 @@ async def send_extrape_deal_with_retry(job: dict):
                 await asyncio.sleep(wait_time)
 
             except Exception as send_err:
+                err_str = str(send_err).lower()
                 logger.error("Attempt %d/%d failed sending to ExtraPe: %s", attempt, max_retries, send_err)
+                if "file reference has expired" in err_str or "filereference" in err_str:
+                    logger.warning("Media file reference expired. Falling back to sending message text/clean links...")
+                    try:
+                        text_to_send = event.message.text or ""
+                        if not text_to_send and deal_urls:
+                            text_to_send = "\n".join(deal_urls)
+                        if text_to_send:
+                            await client.send_message(target_bot_entity, text_to_send, link_preview=False)
+                            logger.info("✓ Successfully sent deal text to ExtraPe (media skipped).")
+                            stats["extrape_deals"] += 1
+                            stats["last_deal_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                            stats["last_deal_title"] = f"Deal from [{channel_name}] (text fallback)"
+                            return
+                    except Exception as fallback_err:
+                        logger.error("Fallback text send to ExtraPe also failed: %s", fallback_err)
+
                 if attempt < max_retries:
                     await asyncio.sleep(2 * attempt)
                 else:
@@ -223,6 +276,9 @@ async def send_extrape_deal_with_retry(job: dict):
                         link_preview=False,
                     )
                     logger.info("✓ Delivered link to ExtraPe: %s", url)
+                    stats["extrape_deals"] += 1
+                    stats["last_deal_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    stats["last_deal_title"] = f"Deal link from [{channel_name}]"
                     break
                 except FloodWaitError as flood_err:
                     wait_time = flood_err.seconds + 2
@@ -373,11 +429,27 @@ async def initialize():
 
     # Authenticate if session not saved
     if not await client.is_user_authorized():
+        if os.getenv("PORT") or os.getenv("RENDER"):
+            err_msg = (
+                "CRITICAL: Telegram client is not authorized on Render! "
+                "Cloud containers cannot prompt for SMS/login codes interactively. "
+                "You must set the TELEGRAM_STRING_SESSION environment variable in your Render Dashboard. "
+                "Run 'python3 export_session.py' on your local Mac to copy your StringSession."
+            )
+            logger.fatal(err_msg)
+            stats["status"] = "Unauthorized (Missing TELEGRAM_STRING_SESSION)"
+            stats["error"] = err_msg
+            return False
+
         logger.info("Client is not authorized. Starting interactive authentication...")
         phone = config.PHONE_NUMBER or input("Enter your Telegram phone number (international format): ").strip()
         await client.start(phone=phone)
 
     current_user = await client.get_me()
+    stats["telegram_connected"] = True
+    stats["status"] = "Online (Active 24/7)"
+    user_display = f"{current_user.first_name or ''} {current_user.last_name or ''}".strip()
+    stats["user"] = f"{user_display} (@{current_user.username or 'N/A'} | ID: {current_user.id})"
     logger.info(
         "Logged in as: %s %s (@%s | ID: %d)",
         current_user.first_name or "",
@@ -399,7 +471,8 @@ async def initialize():
         )
     except Exception as exc:
         logger.error("Failed to resolve target bot '%s': %s", config.TARGET_BOT, exc)
-        sys.exit(1)
+        stats["error"] = f"Failed to resolve target bot '{config.TARGET_BOT}': {exc}"
+        return False
 
     # Resolve User's Amazon Telegram Channel (if configured)
     if config.MY_TELEGRAM_CHANNEL:
@@ -432,6 +505,8 @@ async def initialize():
         except Exception as exc:
             logger.warning("  ✗ Warning: Could not resolve channel '%s': %s", ch, exc)
 
+    stats["source_channels"] = resolved_channels
+
     logger.info("Configuration Summary:")
     logger.info("  - Forward Full Message: %s", config.FORWARD_FULL_MESSAGE)
     logger.info("  - Amazon Affiliate Tag: %s", config.AMAZON_AFFILIATE_TAG or "[NOT CONFIGURED]")
@@ -442,6 +517,7 @@ async def initialize():
     logger.info("  - Monitored Source Channels: %s", resolved_channels)
     logger.info("=" * 60)
     logger.info("Listening for deals... Press Ctrl+C to stop.")
+    return True
 
 
 from aiohttp import web
@@ -456,16 +532,103 @@ async def start_health_check_server():
     app = web.Application()
 
     async def handle_ping(request):
-        return web.Response(text="Telegram Deal Forwarder is active and running 24/7!", status=200)
+        # JSON format if explicitly requested
+        if request.headers.get("Accept") == "application/json" or request.query.get("format") == "json":
+            return web.json_response({"status": "ok", "stats": stats})
+
+        # Modern HTML status dashboard
+        is_online = stats["status"].startswith("Online")
+        status_color = "#10b981" if is_online else ("#f59e0b" if stats["status"] == "Starting" else "#ef4444")
+        status_badge = "ACTIVE 24/7" if is_online else ("STARTING" if stats["status"] == "Starting" else "ATTENTION REQUIRED")
+
+        channel_list = stats.get("source_channels") or config.SOURCE_CHANNELS
+        channels_html = "".join(f"<span class='tag'>{ch}</span>" for ch in channel_list) if channel_list else "<span style='color:#94a3b8;'>None</span>"
+
+        error_box = f"<div class='alert'><strong>Action Required:</strong> {stats['error']}</div>" if stats.get("error") else ""
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telegram Deal Forwarder - Status</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }}
+        body {{ background: #0f172a; color: #f8fafc; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }}
+        .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 32px; max-width: 640px; width: 100%; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5); }}
+        .header {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #334155; }}
+        .title {{ font-size: 20px; font-weight: 700; color: #38bdf8; display: flex; align-items: center; gap: 10px; }}
+        .badge {{ background: {status_color}22; color: {status_color}; border: 1px solid {status_color}; padding: 4px 12px; border-radius: 9999px; font-size: 12px; font-weight: 700; letter-spacing: 0.5px; display: inline-flex; align-items: center; gap: 6px; }}
+        .badge::before {{ content: ''; width: 8px; height: 8px; background: {status_color}; border-radius: 50%; box-shadow: 0 0 8px {status_color}; }}
+        .grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-bottom: 24px; }}
+        .stat-box {{ background: #0f172a; border: 1px solid #334155; border-radius: 12px; padding: 16px; }}
+        .stat-label {{ font-size: 12px; color: #94a3b8; text-transform: uppercase; font-weight: 600; margin-bottom: 6px; }}
+        .stat-val {{ font-size: 24px; font-weight: 700; color: #f1f5f9; }}
+        .info-row {{ margin-bottom: 14px; font-size: 14px; color: #cbd5e1; display: flex; justify-content: space-between; gap: 12px; }}
+        .info-label {{ color: #94a3b8; font-weight: 500; flex-shrink: 0; }}
+        .tag {{ background: #0284c7; color: #fff; padding: 3px 10px; border-radius: 6px; font-size: 12px; margin-right: 6px; margin-top: 6px; display: inline-block; }}
+        .alert {{ background: #ef444422; border: 1px solid #ef4444; border-radius: 10px; padding: 14px; margin-bottom: 20px; color: #fca5a5; font-size: 13px; line-height: 1.5; }}
+        .footer {{ text-align: center; font-size: 12px; color: #64748b; margin-top: 24px; border-top: 1px solid #334155; padding-top: 16px; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="header">
+            <div class="title">⚡ Telegram Deal Forwarder</div>
+            <span class="badge">{status_badge}</span>
+        </div>
+        {error_box}
+        <div class="grid">
+            <div class="stat-box">
+                <div class="stat-label">Amazon Deals Sent</div>
+                <div class="stat-val">{stats['amazon_deals']}</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">ExtraPe Deals Sent</div>
+                <div class="stat-val">{stats['extrape_deals']}</div>
+            </div>
+        </div>
+        <div class="info-row">
+            <span class="info-label">Telegram Account:</span>
+            <span>{stats.get('user') or 'Connecting...'}</span>
+        </div>
+        <div class="info-row">
+            <span class="info-label">Target Channel (Amazon):</span>
+            <span style="color: #38bdf8; font-weight: 600;">{stats['target_channel']}</span>
+        </div>
+        <div class="info-row">
+            <span class="info-label">Target Bot (ExtraPe):</span>
+            <span style="color: #a78bfa; font-weight: 600;">{stats['target_bot']}</span>
+        </div>
+        <div class="info-row">
+            <span class="info-label">Last Deal Processed:</span>
+            <span>{stats.get('last_deal_at') or 'Waiting for new deals...'}</span>
+        </div>
+        <div style="margin-top: 14px;">
+            <div class="info-label" style="margin-bottom: 6px;">Monitored Source Channels:</div>
+            <div>{channels_html}</div>
+        </div>
+        <div class="footer">
+            UptimeRobot Keep-Alive: OK (HTTP 200) • Powered by Telethon & Render
+        </div>
+    </div>
+</body>
+</html>"""
+        return web.Response(text=html, content_type="text/html", status=200)
+
+    async def handle_health(request):
+        status_code = 200 if stats["status"].startswith("Online") or stats["status"] == "Starting" else 503
+        return web.json_response({"status": stats["status"], "stats": stats}, status=status_code)
 
     app.router.add_get("/", handle_ping)
-    app.router.add_get("/health", handle_ping)
+    app.router.add_get("/health", handle_health)
+    app.router.add_get("/status", handle_health)
 
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info("Health-check web server running on port %d for Render.", port)
+    logger.info("Health-check web server running on port %d for Render & UptimeRobot.", port)
     return runner
 
 
@@ -473,17 +636,28 @@ async def start_health_check_server():
 # Main Lifecycle Runner
 # ==============================================================================
 async def main():
-    await initialize()
+    stats["uptime_start"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    # Start health-check server if deployed on cloud (Render sets $PORT)
+    # 1. Start health-check server FIRST so Render immediately detects port binding on $PORT
+    #    and UptimeRobot gets 200 OK without waiting on Telegram resolution.
     web_runner = await start_health_check_server()
 
-    # Start the rate-limited dispatch worker in the background
+    # 2. Start the rate-limited dispatch worker in the background
     worker_task = asyncio.create_task(queue_worker())
 
-    # Keep client listening until disconnected
+    is_initialized = False
     try:
-        await client.run_until_disconnected()
+        # 3. Connect and initialize Telegram
+        is_initialized = await initialize()
+        if is_initialized:
+            logger.info("Forwarder successfully initialized. Listening for deals 24/7...")
+            # Keep client listening until disconnected
+            await client.run_until_disconnected()
+        else:
+            logger.error("Telegram initialization failed. Web server will stay alive for diagnostics.")
+            # Keep web server active so Render does not crash-loop, allowing the user to view diagnostics
+            while True:
+                await asyncio.sleep(3600)
     finally:
         logger.info("Shutting down worker task...")
         worker_task.cancel()
@@ -492,7 +666,8 @@ async def main():
             await web_runner.cleanup()
         if aiohttp_session and not aiohttp_session.closed:
             await aiohttp_session.close()
-        await client.disconnect()
+        if is_initialized:
+            await client.disconnect()
         logger.info("Telegram client disconnected cleanly.")
 
 
@@ -503,3 +678,4 @@ if __name__ == "__main__":
         logger.info("Forwarder stopped by user (KeyboardInterrupt).")
     except Exception as e:
         logger.fatal("Fatal runtime error: %s", e, exc_info=True)
+
