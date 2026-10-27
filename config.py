@@ -56,6 +56,7 @@ API_ID_RAW = os.getenv("TELEGRAM_API_ID", "")
 API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 PHONE_NUMBER = os.getenv("TELEGRAM_PHONE", "").strip()
 SESSION_NAME = os.getenv("SESSION_NAME", "extrape_userbot").strip()
+STRING_SESSION = os.getenv("TELEGRAM_STRING_SESSION", "").strip()
 
 try:
     API_ID = int(API_ID_RAW) if API_ID_RAW else 0

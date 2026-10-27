@@ -45,8 +45,16 @@ logging.getLogger("telethon").setLevel(logging.WARNING)
 # ==============================================================================
 # Telegram Client Initialization
 # ==============================================================================
+from telethon.sessions import StringSession
+
+if config.STRING_SESSION:
+    session_target = StringSession(config.STRING_SESSION)
+    logger.info("Using Telethon StringSession for cloud deployment.")
+else:
+    session_target = config.SESSION_NAME
+
 client = TelegramClient(
-    config.SESSION_NAME,
+    session_target,
     config.API_ID,
     config.API_HASH,
 )
@@ -435,11 +443,39 @@ async def initialize():
     logger.info("Listening for deals... Press Ctrl+C to stop.")
 
 
+from aiohttp import web
+
+async def start_health_check_server():
+    """Starts a lightweight HTTP server on $PORT for cloud health checks (Render) and uptime monitoring."""
+    port_str = os.getenv("PORT")
+    if not port_str:
+        return None  # Running locally on Mac, no HTTP server needed
+
+    port = int(port_str)
+    app = web.Application()
+
+    async def handle_ping(request):
+        return web.Response(text="Telegram Deal Forwarder is active and running 24/7!", status=200)
+
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/health", handle_ping)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("Health-check web server running on port %d for Render.", port)
+    return runner
+
+
 # ==============================================================================
 # Main Lifecycle Runner
 # ==============================================================================
 async def main():
     await initialize()
+
+    # Start health-check server if deployed on cloud (Render sets $PORT)
+    web_runner = await start_health_check_server()
 
     # Start the rate-limited dispatch worker in the background
     worker_task = asyncio.create_task(queue_worker())
@@ -451,6 +487,8 @@ async def main():
         logger.info("Shutting down worker task...")
         worker_task.cancel()
         await asyncio.gather(worker_task, return_exceptions=True)
+        if web_runner:
+            await web_runner.cleanup()
         if aiohttp_session and not aiohttp_session.closed:
             await aiohttp_session.close()
         await client.disconnect()
