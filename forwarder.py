@@ -12,6 +12,7 @@ Monitors Telegram deal channels in real-time:
 
 import asyncio
 import logging
+import os
 import random
 import sys
 from typing import List, Optional
